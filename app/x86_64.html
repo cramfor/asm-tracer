@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html>
+  <head>
+
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+    <link rel="stylesheet" type="text/css" href="/static/bulma.min.css">
+    <link rel="stylesheet" type="text/css" href="/static/base.css">
+    <style>
+      /* 修复页面抖动：悬停栈/寄存器值时弹出的进制转换浮层必须脱离文档流，
+       * 否则它的显示/隐藏会改变文档高度 -> 页面滚动条出现/消失 -> 视口宽度
+       * 变化 -> 流式列重排 -> 鼠标下元素移位 -> 触发 mouseleave/mouseenter 循环 */
+      #reg_base_display, #stack_base_display {
+        position: fixed;
+        right: 1rem;
+        bottom: 1rem;
+        z-index: 30;
+        background: #fff;
+        border: 1px solid #dbdbdb;
+        border-radius: 6px;
+        box-shadow: 0 2px 8px rgba(0,0,0,.15);
+        font-family: monospace;
+      }
+    </style>
+    <link rel="shortcut icon" href="/static/favicon.ico">
+
+    
+    <script>
+    /* myjson 由 asm_tracer.py --format myjson 生成（app/static/trace.json）。
+     * asm.js 加载时会立即读取全局变量 myjson 和 inmode，
+     * 所以必须先 fetch + JSON.parse 完成，再动态加载 asm.js。 */
+    var inmode = "fullprog";
+    var myjson = null;
+    fetch("/static/trace.json")
+      .then(function (resp) {
+        if (!resp.ok) { throw new Error("HTTP " + resp.status); }
+        return resp.text();
+      })
+      .then(function (text) {
+        myjson = JSON.parse(text);
+        var s = document.createElement("script");
+        s.src = "/static/asm.js";
+        document.head.appendChild(s);
+      })
+      .catch(function (e) {
+        document.getElementById("error").textContent =
+          "加载 /static/trace.json 失败：" + e.message +
+          "（请用 asm_tracer.py --format myjson 生成 trace.json 放入 static/，并通过 HTTP 服务访问本页）";
+        document.getElementById("errorDiv").style.display = "block";
+      });
+  </script>
+<!--<div class="content" id="testing"></div>-->
+
+
+    <!-- TODO: Name? -->
+    <title>ASM Visualizer</title>
+  </head>
+
+  <body>
+    <section class="section">
+      <div class="container">
+        
+
+<!--CONDITIONAL DISPLAYS-->
+<!--
+<div class="temp_header" id="blank">
+  <pre></pre>
+</div>
+-->
+<a href="/">
+  <img style="width: 7%; height:auto" src="../../static/DiSFish_Large.png">
+</a>
+<div class="temp_header" id="errorDiv">
+  <pre>
+    <div class="content" id="error">
+    </div>
+  </pre>
+</div>
+<div class="temp_header" id="warningDiv">
+  <pre>
+    <div class="content" id="warning">
+    </div>
+  </pre>
+</div>
+
+<!-- INSTRUCTION TABLE -->
+<div class="columns is-borderless" style="border: 0; margin-top:5%">
+  <!-- Left column for instructions. -->
+  <div class="column is-5 is-borderless" style="border: 0;">
+    <div class="columns is-centered">
+      <div class="column">
+        <div class="content">
+          <h1>Instructions</h1>
+        </div>
+        <div class="content" id="instruction_content" style="max-height: 40vh;overflow-y: scroll;">
+          <p>Loading execution data.  Please wait...</p>
+          <progress class="progress is-large is-info" max="100"></progress>
+        </div>
+      </div>
+    </div>
+    <!---<div class="content" id="autoscroll_option">
+      <label class="checkbox">
+        <input type="checkbox" id="instrAutoScroll" checked>
+        Autoscroll to current instruction
+      </label>
+    </div>
+    <div class="content" id="expand_option">
+      <label class="checkbox">
+        <input type="checkbox" id="offset">
+        Show all instructions
+      </label>
+    </div>-->
+    <label class="checkbox">
+      <input type="checkbox" id="instrAutoScroll" checked>
+      Autoscroll to current instruction
+    </label>
+    <br>
+    <label class="checkbox" id="offset_div">
+      <input type="checkbox" id="offset" checked>
+      Show all instructions
+    </label>
+    <!-- TRACE ARROWS -->
+    <div style="vertical-align:middle;">
+      <table class="table-borderless">
+        <tr class="is-borderless">
+          <td>
+            <figure class="image is-24x24" style="display: inline-block">
+              <img src="/static/prev_line.png">
+            </figure>
+          </td>
+          <td>
+            <p style="display: inline-block">line that just executed</p>
+          </td>
+        </tr>
+      </table>
+    </div>
+    <div style="vertical-align:middle;">
+      <table class="table-borderless">
+        <tr class="is-borderless">
+          <td>
+            <figure class="image is-24x24" style="display: inline-block">
+              <img src="/static/next_line.png">
+            </figure>
+          </td>
+          <td>
+            <p style="display: inline-block">next line to execute</p>
+          </td>
+        </tr>
+      </table>
+    </div>
+  </div>
+  <!-- STACK CONTENT DISPLAY -->
+  <!-- Right column further divided into
+       stack / register columns below. -->
+  <div class="column">
+    <div class="columns">
+      <div class="column">
+        <div class="content">
+          <h1>Stack Content</h1>
+        </div>
+        <div class="content" id="stack_content" style="max-height: 40vh;overflow-y: scroll;">
+          <p>Loading execution data.  Please wait...</p>
+          <progress class="progress is-large is-info" max="100"></progress>
+        </div>
+        <label class="checkbox">
+          <input type="checkbox" id="stackAutoScroll" checked>
+          Autoscroll to stack pointer
+        </label>
+
+        <!-- STACK & FRAME POINTERS -->
+        <div style="vertical-align:middle;">
+          <table class="table-borderless">
+            <tr class="is-borderless">
+              <td>
+                <figure class="image is-24x24" style="display: inline-block">
+                  <img src="/static/stack_pointer.png">
+                </figure>
+              </td>
+              <td>
+                <p style="display: inline-block">stack pointer</p>
+              </td>
+            </tr>
+          </table>
+        </div>
+        <div style="vertical-align:middle;">
+          <table class="table-borderless">
+            <tr class="is-borderless">
+              <td>
+                <figure class="image is-24x24" style="display: inline-block">
+                  <img src="/static/frame_pointer.png">
+                </figure>
+              </td>
+              <td>
+                <p style="display: inline-block">frame pointer</p>
+              </td>
+            </tr>
+          </table>
+        </div>
+        <div id="stack_base_display" style="display:none;padding:10px;"></div>
+      </div>
+      <div class="column">
+        <div class="content">
+
+          <!-- REGISTER DISPLAY -->
+          <h1>Register Contents</h1>
+        </div>
+        <div class="content" id="register_content" style="max-height: 40vh;overflow-y: scroll;">
+          <p>Loading execution data.  Please wait...</p>
+          <progress class="progress is-large is-info" max="100"></progress>
+        </div>
+        <div id="reg_base_display" style="display:none;padding:10px;"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="content" id="outputDiv">
+  <h1>Program Output</h1>
+  <div class="notification" id="output">
+  </div>
+</div>
+
+<div class="footer">
+  <div class="content has-text-centered">
+    <p style="display:inline">Step</p>
+    <input type="number" id = "jump_to_step" style = "height: 37px; width: 55px; margin-bottom: 7px; margin-right: 5px; margin-left: 5px; display: inline;">
+    <p id="step_text" style="display:inline"></p>
+  </div>
+  <div class="buttons is-centered">
+   <button class="button" id="button_first">First</button>
+    <button class="button" id="button_prev">Prev</button>
+    <button class="button" id="button_next">Next</button>
+    <button class="button" id="button_last">Last</button>
+  </div>
+</div>
+
+
+      </div>
+    </section>
+  </body>
+</html>

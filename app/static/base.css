@@ -1,0 +1,33 @@
+.address_match_highlight {
+  background-color: #df8439;
+  /* color: black; */
+}
+
+.updated_text {
+  /* color: #b1521c; */
+  font-weight: 500;
+  /*color: #df8439;*/
+  color: #ff0000;
+}
+
+.in_scope {
+  background-color: #cce5ff;
+}
+
+.footer {
+  position: fixed;
+  left: 0;
+  bottom: 0;
+  width: 100%;
+  padding:10px;
+  text-align:center;
+}
+
+.temp_header {
+  left: 0;
+  top: 0;
+  width: 100%;
+  padding:0px;
+  text-align:left;
+  max-height:5%;
+}
