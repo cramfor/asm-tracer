@@ -65,19 +65,8 @@ static/trace.json，用上一步/下一步按钮逐条查看指令、寄存器�
 
 ## 目录结构
 
-text
-asm-tracer/
-├── asm_tracer.py          # 追踪器
-├── user.s                 # 示例输入：手写 x86-64 汇编，此次取自godbolt.org生成的汇编
-└── app/
-    ├── index.html
-    ├── x86_64.html        # ASM Visualizer 前端页面
-    └── static/
-        ├── asm.js         # 前端可视化逻辑
-        ├── base.css
-        ├── bulma.min.css
-        ├── trace.json     # 追踪器输出，前端的数据源
-        └── ...            # 图标等静态资源
+<img width="771" height="286" alt="image" src="https://github.com/user-attachments/assets/9784b246-b18d-4649-b659-3bc52a376a0b" />
+
 
 ## myjson 格式说明
 
