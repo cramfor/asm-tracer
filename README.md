@@ -79,7 +79,6 @@ asm-tracer/
         ├── trace.json     # 追踪器输出，前端的数据源
         └── ...            # 图标等静态资源
 
-
 ## myjson 格式说明
 
 --format myjson输出单个 JSON 对象，包含四段：
