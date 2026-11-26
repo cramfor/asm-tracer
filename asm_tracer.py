@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """
-asm_tracer.py — 用 ptrace + pyelftools 逐指令追踪 x86-64 汇编程序
+asm_tracer.py — 用 ptrace + pyelftools 追踪 Linux x86-64 汇编程序
 
 只记录 user.s 中定义的函数的单步执行信息：
   * 函数名单直接从 user.s 提取（顶格标签），不写死、不依赖符号表类型，
     兼容 godbolt 默认开启 "Filter directives" 的输出（此时符号是
     STT_NOTYPE 且 size=0，旧版会因此报"找不到 main"）；
-  * printf 等 user.s 之外的库函数自动跨过，不记录内部指令；
-  * 入口函数（默认 main，没有则用 _start，也可 --entry 指定）返回后停止。
+  * printf 等 user.s 之外的库函数不写入记录；默认在外部代码中继续
+    “隐藏式单步”，直到回到 user.s，因此可处理 longjmp、库函数回调和
+    其他非局部控制流；
+  * 普通函数入口（默认 main，也可 --entry 指定）返回后停止；入口为
+    _start 时没有调用者返回地址，追踪到进程退出或步数上限为止。
 
 用法:
     python3 asm_tracer.py <executable> <user.s> [-o trace.jsonl]
                           [--entry NAME] [--follow-calls] [--max-steps N]
+                          [--max-external-steps N]
                           [--format jsonl|myjson] [--arch x86-64] [--wordsize 8]
 
 输出:
@@ -19,12 +23,16 @@ asm_tracer.py — 用 ptrace + pyelftools 逐指令追踪 x86-64 汇编程序
     --format myjson : 单个 JSON 对象（system/instructions/code/user 四段），
                       可直接被 ASM Visualizer 前端 JSON.parse 作为 myjson 使用
 
-对被追踪程序的要求:
-    1. godbolt 建议用 -O0 -fno-omit-frame-pointer 编译（保证 rbp 帧链完整）；
-    2. as --gdwarf-5 -o user.o user.s  （生成指向 user.s 的行号表；
+对被追踪程序的要求和限制:
+    1. 当前 ptrace 寄存器布局、栈布局和系统调用约定仅支持 Linux x86-64；
+       --arch/--wordsize 目前只写入输出元数据，不改变 tracer 的体系结构；
+    2. 建议用 -O0 -fno-omit-frame-pointer 编译（保证 rbp 帧链完整）；
+    3. as --gdwarf-5 -o user.o user.s  （生成指向 user.s 的行号表；
        即使 user.s 里没有 .file/.loc，gas 也会按汇编行号生成）；
-    3. gcc -no-pie -o user user.o      （PIE 也支持，自动按 /proc/<pid>/maps
-       计算加载基址；静态/动态链接均可）。
+    4. gcc -no-pie -o user user.o      （PIE 也支持，自动按 /proc/<pid>/maps
+       计算加载基址；静态/动态链接均可）；
+    5. 当前只追踪初始线程；目标程序 fork、clone 或创建线程后的新执行流
+       不会被自动跟随。
 """
 
 import argparse
@@ -32,6 +40,7 @@ import ctypes
 import json
 import os
 import re
+import signal
 import sys
 from ctypes.util import find_library
 
@@ -50,7 +59,9 @@ PTRACE_CONT = 7
 PTRACE_SINGLESTEP = 9
 PTRACE_GETREGS = 12
 PTRACE_SETREGS = 13
-SIGTRAP = 5
+PTRACE_SETOPTIONS = 0x4200
+PTRACE_O_EXITKILL = 0x100000
+SIGTRAP = signal.SIGTRAP
 
 REG_NAMES = [
     "r15", "r14", "r13", "r12", "rbp", "rbx", "r11", "r10",
@@ -63,7 +74,7 @@ class UserRegs(ctypes.Structure):
     _fields_ = [(n, ctypes.c_ulonglong) for n in REG_NAMES]
 
 def ptrace(request, pid, addr=0, data=0):
-    """用于 CONT/SINGLESTEP/GETREGS/SETREGS：-1 一律视为错误。"""
+    """用于 CONT/SINGLESTEP/GETREGS/SETREGS：-1视为错误。"""
     ctypes.set_errno(0)
     res = libc.ptrace(request, pid, ctypes.c_void_p(addr), ctypes.c_void_p(data))
     if res == -1:
@@ -100,17 +111,84 @@ def write_byte(pid, addr, byte):
     ptrace(PTRACE_POKEDATA, pid, aligned, new_word)
 
 def set_int3(pid, addr):
-    """在 addr 下 int3 断点，返回原字节。"""
-    orig = read_word(pid, addr)
+    """在 addr 下 int3 断点，返回原字节。读取时先按 8 字节对齐。"""
+    aligned = addr & ~7
+    shift = (addr - aligned) * 8
+    orig = read_word(pid, aligned)
     if orig is None:
         raise OSError(f"无法读取 0x{addr:x}，无法下断点")
     write_byte(pid, addr, 0xCC)
-    return orig & 0xFF
+    return (orig >> shift) & 0xFF
 
 def clear_int3(pid, addr, orig_byte):
-    """撤除断点并把 rip 回退到断点处（int3 命中后 rip = addr + 1）。"""
+    """确认当前停在 addr 的 int3 后，恢复原字节并回退 rip。"""
+    regs = get_regs(pid)
+    if regs.rip != addr + 1:
+        raise RuntimeError(
+            f"当前 rip=0x{regs.rip:x}，不是 0x{addr:x} 处 int3 命中后的状态")
     write_byte(pid, addr, orig_byte)
     set_rip(pid, addr)
+
+def single_step_wait(pid):
+    """
+    执行一次 PTRACE_SINGLESTEP，并透传停止时收到的非 SIGTRAP 信号。
+    单步完成返回寄存器；进程退出或被信号杀死时返回 None。
+    """
+    pending_sig = 0
+    while True:
+        ptrace(PTRACE_SINGLESTEP, pid, 0, pending_sig)
+        pending_sig = 0
+
+        _, status = os.waitpid(pid, 0)
+        if os.WIFEXITED(status) or os.WIFSIGNALED(status):
+            return None
+        if not os.WIFSTOPPED(status):
+            raise RuntimeError(f"单步后收到无法处理的 wait status=0x{status:x}")
+
+        sig = os.WSTOPSIG(status)
+        if sig == SIGTRAP:
+            return get_regs(pid)
+
+        # 信号尚未真正交给 tracee；下次 ptrace 请求时继续投递。
+        pending_sig = sig
+
+def wait_for_breakpoint(pid, addr):
+    """
+    继续运行直到命中 addr 处的 int3；非 SIGTRAP 信号透传。
+    命中返回 True，进程退出返回 False。
+    """
+    pending_sig = 0
+    while True:
+        ptrace(PTRACE_CONT, pid, 0, pending_sig)
+        pending_sig = 0
+
+        _, status = os.waitpid(pid, 0)
+        if os.WIFEXITED(status) or os.WIFSIGNALED(status):
+            return False
+        if not os.WIFSTOPPED(status):
+            raise RuntimeError(f"等待断点时收到无法处理的 wait status=0x{status:x}")
+
+        sig = os.WSTOPSIG(status)
+        if sig == SIGTRAP:
+            regs = get_regs(pid)
+            if regs.rip == addr + 1:
+                return True
+            raise RuntimeError(
+                f"收到非预期 SIGTRAP：rip=0x{regs.rip:x}，"
+                f"期望命中 0x{addr:x} 处的断点")
+
+        pending_sig = sig
+
+def terminate_child(pid):
+    """异常或提前结束追踪时杀死并回收子进程，避免留下 ptrace-stopped 进程。"""
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    try:
+        os.waitpid(pid, 0)
+    except ChildProcessError:
+        pass
 
 # ---------- 从 user.s 提取函数名 ----------
 def extract_functions_from_asm(asm_path):
@@ -121,7 +199,7 @@ def extract_functions_from_asm(asm_path):
     之后会与符号表的可执行节信息取交集，自动剔除。
     """
     names, seen = [], set()
-    with open(asm_path) as f:
+    with open(asm_path, encoding="utf-8", errors="replace") as f:
         for line in f:
             m = re.match(r"^([A-Za-z_][A-Za-z0-9_.$]*):", line)
             if m and m.group(1) not in seen:
@@ -139,6 +217,7 @@ class DwarfLookup:
         self.f = open(elf_path, "rb")
         self.elffile = ELFFile(self.f)
         if not self.elffile.has_dwarf_info():
+            self.f.close()
             raise RuntimeError("ELF 没有 DWARF 调试信息；请用 as --gdwarf-5 汇编 user.s")
         self.dwarfinfo = self.elffile.get_dwarf_info()
         self.bias = 0  # PIE 加载基址，子进程启动后由 compute_bias() 设置
@@ -250,8 +329,9 @@ def compute_bias(dwarf, pid, exe_path):
 # ---------- 栈内容采集 ----------
 def collect_stack(pid, rsp, top=None, max_bytes=8192):
     """从 RSP 起按 8 字节读取栈内容，{地址: 值}。
-    top 给定上界（不含）：只收集 [rsp, top) 区间，即入口函数自己的栈帧范围，
-    不包含 __libc_start_main 等调用者残留在高地址的内容。遇到不可读地址即停止。"""
+    top 给定上界（不含）：收集 [rsp, top) 区间。该区间通常覆盖入口函数
+    及其被调函数当前使用的栈地址范围；刚进入窗口的地址可能含有历史残留，
+    只有被当前调用链实际写入后，其值才属于当前栈帧。遇到不可读地址即停止。"""
     if top is None:
         top = rsp + 256          # 未指定上界时退化为固定 256 字节窗口
     result = {}
@@ -272,7 +352,8 @@ def collect_stack_trace(pid, regs, dwarf, max_frames=64):
         [rbp]   = 调用者的 rbp
         [rbp+8] = 返回地址（位于调用者内部）
         调用者 rsp = rbp + 16
-    function 归属：frame 0 用 rip 查当前函数；frame i+1 用 frame i 的返回地址查。
+    function 归属：frame 0 用 rip 查当前函数；frame i+1 用 frame i 的
+    返回地址减一查（返回地址是 call 的下一条指令，减一可确保仍位于调用者内）。
     """
     frames = [{
         "SP": f"0x{regs.rsp:X}",
@@ -290,7 +371,7 @@ def collect_stack_trace(pid, regs, dwarf, max_frames=64):
         frames.append({
             "SP": f"0x{bp + 16:X}",
             "BP": f"0x{saved_bp:X}",
-            "function": dwarf.addr_to_name(ret_addr),
+            "function": dwarf.addr_to_name(ret_addr - 1),
         })
         bp = saved_bp
     return {str(i): f for i, f in enumerate(frames)}
@@ -317,7 +398,8 @@ def build_myjson(records, asm_path, dwarf, arch, wordsize):
       code:         {行号字符串: [地址, 汇编文本]}，非指令行地址为 "0x0"
       user:         user.s 原文行数组
     """
-    lines = open(asm_path).read().splitlines()
+    with open(asm_path, encoding="utf-8", errors="replace") as f:
+        lines = f.read().splitlines()
 
     # 行号 -> 指令地址（链接时地址 + bias，与记录中的运行时地址口径一致）
     line_addr = {}
@@ -351,128 +433,208 @@ def build_myjson(records, asm_path, dwarf, arch, wordsize):
     }
 
 # ---------- 主追踪逻辑 ----------
-def trace(executable, asm_path, out, entry=None, follow_calls=False, max_steps=1_000_000,
+def trace(executable, asm_path, out, entry=None, follow_calls=False,
+          max_steps=1_000_000, max_external_steps=1_000_000,
           fmt="jsonl", arch="x86-64", wordsize=8):
+    if max_steps < 0:
+        raise ValueError("max_steps 不能为负数")
+    if max_external_steps < 1:
+        raise ValueError("max_external_steps 必须大于 0")
+
     func_names = extract_functions_from_asm(asm_path)
     if not func_names:
-        raise RuntimeError(f"从 {asm_path} 中没有提取到任何函数标签（顶格、非点开头的 label）")
+        raise RuntimeError(f"从 {asm_path} 中没有提取到函数标签（顶格、非点开头的 label）")
 
     dwarf = DwarfLookup(executable, func_names)
-    if not dwarf.user_funcs:
-        raise RuntimeError(
-            f"user.s 提取到的函数 {func_names} 在可执行文件的符号表里找不到对应项，"
-            f"请确认 {executable} 是由该 user.s 汇编链接生成的")
-
-    # 入口函数：--entry 指定 > main > _start
-    if entry is None:
-        entry = "main" if dwarf.func_addr("main") is not None else "_start"
-    entry_link = dwarf.func_addr(entry)
-    if entry_link is None:
-        avail = [n for _, _, n in dwarf.user_funcs]
-        raise RuntimeError(f"找不到入口函数 {entry}；user.s 中可用的函数: {avail}，"
-                           f"请用 --entry 指定")
-
-    print(f"# 追踪函数: {[n for _, _, n in dwarf.user_funcs]}，入口: {entry}", file=sys.stderr)
-
-    pid = os.fork()
-    if pid == 0:
-        # 子进程：声明被追踪，stdout 重定向到 /dev/null 以免污染 JSON，然后 exec
-        libc.ptrace(PTRACE_TRACEME, 0, None, None)
-        devnull = os.open(os.devnull, os.O_WRONLY)
-        os.dup2(devnull, 1)
-        os.execv(executable, [executable])
-        os._exit(1)
-
-    # exec 完成后的第一次 SIGTRAP 停止
-    _, status = os.waitpid(pid, 0)
-    if not os.WIFSTOPPED(status):
-        raise RuntimeError("子进程未正常停止")
-
-    dwarf.bias = compute_bias(dwarf, pid, executable)
-    entry_addr = entry_link + dwarf.bias
-
-    # ---- 在入口函数下一次性断点，跳过动态链接器和 libc 初始化 ----
-    orig_byte = set_int3(pid, entry_addr)
-    ptrace(PTRACE_CONT, pid)
-    _, status = os.waitpid(pid, 0)
-    if not (os.WIFSTOPPED(status) and os.WSTOPSIG(status) == SIGTRAP):
-        raise RuntimeError(f"未在 {entry} 命中断点, status=0x{status:x}")
-    clear_int3(pid, entry_addr, orig_byte)    # 恢复原字节并回退 rip
-
-    regs = get_regs(pid)
-    entry_rsp = regs.rsp
-    entry_ret_addr = read_word(pid, entry_rsp)  # main 返回到 __libc_start_main 的地址
-    # 栈采集上界：入口时的 rsp + 8（含返回地址槽位）。
-    # 入口函数的帧只会向下增长，因此窗口 [rsp, entry_rsp+8) 恰好只包含
-    # main 及其被调函数产生的内容，不含 __libc_start_main 的残留。
-    stack_top = entry_rsp + 8
-
+    pid = None
+    child_exited = False
     records = []
-    def emit(regs):
-        records.append({
-            "address": f"0x{regs.rip:X}",
-            "lineno": dwarf.addr_to_line(regs.rip),
-            "registers": collect_registers(regs),
-            "stack_contents": collect_stack(pid, regs.rsp, top=stack_top),
-            "stack_trace": collect_stack_trace(pid, regs, dwarf),
-        })
-
     step = 0
-    while step < max_steps:
-        regs = get_regs(pid)
+    stop_reason = f"达到记录步数上限 {max_steps}"
+    trace_error = None
 
-        # 入口函数执行 ret 后：rip == 返回地址 且 rsp == entry_rsp + 8。
-        # 必须先于"跳过外部代码"判断：返回后 rip 也在 user.s 函数之外，
-        # 若不先退出，会把栈上 [rsp] 误当返回地址下断点。
-        if regs.rip == entry_ret_addr and regs.rsp == entry_rsp + 8:
-            break
+    def write_records():
+        """成功时写完整结果；异常时若已有记录，则写部分结果。"""
+        if fmt == "myjson":
+            json.dump(build_myjson(records, asm_path, dwarf, arch, wordsize),
+                      out, ensure_ascii=False)
+            out.write("\n")
+        else:
+            for i, rec in enumerate(records):
+                print(json.dumps({"step": i, **rec}, ensure_ascii=False), file=out)
 
-        # 跨过 user.s 函数之外的代码（PLT / printf 等 libc 函数 / ld.so）：
-        # call 执行后 [rsp] 即返回地址，在那里下一次性断点继续跑，
-        # 库函数内部既不逐条执行记录，也不产生记录。
-        if not follow_calls and dwarf.addr_to_func(regs.rip) == "":
-            ret = read_word(pid, regs.rsp)
-            if not ret:      # 读不到或返回地址为 0，无法安全跳过
-                break
-            b = set_int3(pid, ret)
-            exited = False
-            while True:
-                ptrace(PTRACE_CONT, pid)
-                _, status = os.waitpid(pid, 0)
-                if os.WIFEXITED(status) or os.WIFSIGNALED(status):
-                    exited = True
-                    break
-                sig = os.WSTOPSIG(status)
-                if sig == SIGTRAP:
-                    break
-                ptrace(PTRACE_CONT, pid, 0, sig)  # 透传其他信号
-            clear_int3(pid, ret, b)
-            if exited:       # 库函数里直接 exit() 的情况
-                break
-            continue         # 回到循环顶：rip 应已回到 user.s 函数内（或入口返回处）
+    try:
+        if not dwarf.user_funcs:
+            raise RuntimeError(
+                f"user.s 提取到的函数 {func_names} 在可执行文件的符号表里找不到对应项，"
+                f"请确认 {executable} 是由该 user.s 汇编链接生成的")
 
-        # 只记录 user.s 中函数的单步信息（--follow-calls 时记录全部）
-        if follow_calls or dwarf.addr_to_func(regs.rip) != "":
-            emit(regs)
-            step += 1
+        # 入口函数：--entry 指定 > main > _start
+        if entry is None:
+            entry = "main" if dwarf.func_addr("main") is not None else "_start"
+        entry_link = dwarf.func_addr(entry)
+        if entry_link is None:
+            avail = [n for _, _, n in dwarf.user_funcs]
+            raise RuntimeError(f"找不到入口函数 {entry}；user.s 中可用的函数: {avail}，"
+                               f"请用 --entry 指定")
 
-        ptrace(PTRACE_SINGLESTEP, pid)
+        print(f"# 追踪函数: {[n for _, _, n in dwarf.user_funcs]}，入口: {entry}",
+              file=sys.stderr)
+
+        # exec 使用解析后的真实路径，避免依赖 PATH；argv[0] 仍保留用户给定形式。
+        exec_path = os.path.realpath(executable)
+        pid = os.fork()
+        if pid == 0:
+            try:
+                ctypes.set_errno(0)
+                if libc.ptrace(PTRACE_TRACEME, 0, None, None) == -1:
+                    err = ctypes.get_errno()
+                    print(f"ptrace TRACEME 失败: {os.strerror(err)}", file=sys.stderr)
+                    os._exit(101)
+
+                # stdout 重定向到 /dev/null，避免目标程序输出污染 JSON。
+                devnull = os.open(os.devnull, os.O_WRONLY)
+                os.dup2(devnull, 1)
+                os.close(devnull)
+                os.execv(exec_path, [executable])
+            except BaseException as exc:
+                print(f"子进程 exec 失败: {exc}", file=sys.stderr)
+            os._exit(127)
+
+        # exec 完成后的第一次 SIGTRAP 停止。
         _, status = os.waitpid(pid, 0)
         if os.WIFEXITED(status) or os.WIFSIGNALED(status):
-            break
+            child_exited = True
+            raise RuntimeError(f"子进程启动失败或过早退出, status=0x{status:x}")
+        if not os.WIFSTOPPED(status):
+            raise RuntimeError(f"子进程未正常停止, status=0x{status:x}")
 
-    # ---- 写出结果 ----
-    if fmt == "myjson":
-        json.dump(build_myjson(records, asm_path, dwarf, arch, wordsize),
-                  out, ensure_ascii=False)
-        out.write("\n")
-    else:
-        for i, rec in enumerate(records):
-            print(json.dumps({"step": i, **rec}, ensure_ascii=False), file=out)
-    out.flush()
+        # 若 tracer 因未捕获异常、KeyboardInterrupt 等原因死亡，由内核杀死 tracee。
+        ptrace(PTRACE_SETOPTIONS, pid, 0, PTRACE_O_EXITKILL)
 
-    print(f"# 共记录 {step} 步（进入 {entry} 起，到其返回/进程退出止）", file=sys.stderr)
-    dwarf.close()
+        dwarf.bias = compute_bias(dwarf, pid, exec_path)
+        entry_addr = entry_link + dwarf.bias
+
+        # ---- 在入口函数下一次性断点，跳过动态链接器和 libc 初始化 ----
+        orig_byte = set_int3(pid, entry_addr)
+        if not wait_for_breakpoint(pid, entry_addr):
+            child_exited = True
+            raise RuntimeError(f"进程在命中入口函数 {entry} 前退出")
+        clear_int3(pid, entry_addr, orig_byte)    # 恢复原字节并回退 rip
+
+        regs = get_regs(pid)
+        entry_rsp = regs.rsp
+
+        # _start 是进程入口，不是普通函数：[rsp] 是 argc，不是返回地址。
+        # 其他入口默认具有普通函数栈布局，[rsp] 是调用者返回地址。
+        entry_has_caller = entry != "_start"
+        if entry_has_caller:
+            entry_ret_addr = read_word(pid, entry_rsp)
+            if entry_ret_addr is None:
+                raise RuntimeError(f"无法读取入口函数 {entry} 的返回地址")
+        else:
+            entry_ret_addr = None
+
+        # 栈采集上界：入口时的 rsp + 8。
+        # 普通函数入口时包含返回地址槽位；_start 入口时包含 argc 槽位。
+        # 窗口 [当前 rsp, entry_rsp+8) 覆盖入口函数及其被调函数当前使用的
+        # 栈地址范围；刚进入窗口的地址可能含有历史残留。
+        stack_top = entry_rsp + 8
+
+        def emit(regs):
+            records.append({
+                "address": f"0x{regs.rip:X}",
+                "lineno": dwarf.addr_to_line(regs.rip),
+                "registers": collect_registers(regs),
+                "stack_contents": collect_stack(pid, regs.rsp, top=stack_top),
+                "stack_trace": collect_stack_trace(pid, regs, dwarf),
+            })
+
+        def is_entry_return(regs):
+            return (entry_ret_addr is not None
+                    and regs.rip == entry_ret_addr
+                    and regs.rsp == entry_rsp + 8)
+
+        while step < max_steps:
+            regs = get_regs(pid)
+
+            # 普通入口函数执行 ret 后：rip == 返回地址 且 rsp == entry_rsp + 8。
+            # 必须先于“隐藏式单步外部代码”判断；_start 没有这种返回状态。
+            if is_entry_return(regs):
+                stop_reason = "入口函数返回到调用者"
+                break
+
+            # 进入 user.s 之外的代码后，采用“隐藏式单步”：外部指令仍逐条
+            # 执行，但不写入 records。这里故意不使用 [rsp] 上的返回地址下
+            # 断点，因为 longjmp、异常展开、库函数回调等路径可能不会普通
+            # 返回到 call 的下一条指令。
+            if not follow_calls and dwarf.addr_to_func(regs.rip) == "":
+                stop_trace = False
+
+                for _ in range(max_external_steps):
+                    regs2 = single_step_wait(pid)
+                    if regs2 is None:
+                        child_exited = True
+                        stop_trace = True
+                        stop_reason = "进程退出"
+                        break
+
+                    if is_entry_return(regs2):
+                        stop_trace = True
+                        stop_reason = "入口函数返回到调用者"
+                        break
+
+                    # 回到 user.s 中的函数；longjmp、回调、异常着陆都能被捕获。
+                    if dwarf.addr_to_func(regs2.rip) != "":
+                        break
+                else:
+                    raise RuntimeError(
+                        f"外部代码隐藏单步超过 {max_external_steps} 次，"
+                        f"可能陷入长时间循环；可用 --max-external-steps 调大")
+
+                if stop_trace:
+                    break
+
+                continue
+
+            # 只记录 user.s 中函数的单步信息（--follow-calls 时记录全部）。
+            if follow_calls or dwarf.addr_to_func(regs.rip) != "":
+                emit(regs)
+                step += 1
+
+            regs_after_step = single_step_wait(pid)
+            if regs_after_step is None:
+                child_exited = True
+                stop_reason = "进程退出"
+                break
+
+    except BaseException as exc:
+        # 保存异常，先统一清理 tracee 并尽量写出已有记录，再重新抛出。
+        trace_error = exc
+    finally:
+        if pid is not None and not child_exited:
+            terminate_child(pid)
+
+    try:
+        if trace_error is not None:
+            # 出错时只有在已有记录的情况下才生成“部分追踪结果”。
+            if records:
+                write_records()
+                out.flush()
+        else:
+            write_records()
+            out.flush()
+    finally:
+        dwarf.close()
+
+    if trace_error is not None:
+        if records:
+            print(f"# 警告：追踪中断，已写出 {len(records)} 条不完整记录",
+                  file=sys.stderr)
+        raise trace_error
+
+    print(f"# 共记录 {step} 步（入口: {entry}；停止原因: {stop_reason}）",
+          file=sys.stderr)
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="ptrace + pyelftools 汇编单步追踪器")
@@ -481,20 +643,25 @@ if __name__ == "__main__":
     ap.add_argument("-o", "--output", help="输出文件（默认 stdout，JSONL 格式）")
     ap.add_argument("--entry", help="入口函数名（默认 main，没有 main 时用 _start）")
     ap.add_argument("--follow-calls", action="store_true",
-                    help="也逐条记录 user.s 之外（libc 等）的指令，默认跨过且不记录")
-    ap.add_argument("--max-steps", type=int, default=1_000_000, help="步数上限")
+                    help="也逐条记录 user.s 之外（libc 等）的指令；默认外部指令隐藏单步但不记录")
+    ap.add_argument("--max-steps", type=int, default=1_000_000,
+                    help="写入 records 的指令数上限；不包含 libc 内部隐藏单步")
+    ap.add_argument("--max-external-steps", type=int, default=1_000_000,
+                    help="外部代码隐藏单步上限，防止在 libc 内无限循环")
     ap.add_argument("--format", choices=["jsonl", "myjson"], default="jsonl",
                     help="jsonl=每步一行（默认）；myjson=ASM Visualizer 前端可直接 "
                          "JSON.parse 的单个 JSON（含 system/instructions/code/user 四段）")
     ap.add_argument("--arch", default="x86-64",
-                    help="myjson 的 system.arch（asm.js 支持 x86-64 / IA32 / arm64）")
-    ap.add_argument("--wordsize", type=int, default=8, help="myjson 的 system.wordsize")
+                    help="写入 myjson system.arch 的元数据；当前 tracer 本身仅支持 Linux x86-64")
+    ap.add_argument("--wordsize", type=int, default=8,
+                    help="写入 myjson system.wordsize 的元数据；当前寄存器读取固定为 x86-64 的 8 字节字")
     args = ap.parse_args()
 
-    out = open(args.output, "w") if args.output else sys.stdout
+    out = open(args.output, "w", encoding="utf-8") if args.output else sys.stdout
     try:
         trace(args.executable, args.asm, out, args.entry, args.follow_calls,
-              args.max_steps, args.format, args.arch, args.wordsize)
+              args.max_steps, args.max_external_steps,
+              args.format, args.arch, args.wordsize)
     finally:
         if out is not sys.stdout:
             out.close()
